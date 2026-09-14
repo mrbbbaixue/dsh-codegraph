@@ -178,9 +178,21 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
 查询走常驻会话时，索引由**后台 daemon 的文件 watcher** 维护：源码写入后经约 2 秒的 debounce（待同步文件
 ≤2 个时 300 ms）自动增量同步。这就是「不需要查询前先 `sync`」的来源。
 
-watcher 覆盖不到的那一小段窗口由 codegraph 自己的 banner 兜底：内容漂移的文件会被标为 changed on disk，
-整个监听停摆时会给出 auto-sync DISABLED 的提示。监听一旦 degrade（WSL2 的 `/mnt`、inotify 配额耗尽、
-`CODEGRAPH_NO_WATCH`），索引就静默不再更新——banner 是模型唯一的信号。
+watcher 覆盖不到的地方有四类提示，全部由 codegraph 服务端自己发出，插件不改写、也不补写：
+
+| 提示 | 出现条件 | 需要 watcher |
+|---|---|---|
+| `⚠️ Some files referenced below were edited since the last index sync — …`（前置 banner） | 响应里提到的文件还在「待同步」集合里 | 是 |
+| `(Note: N file(s) elsewhere in this project are pending index sync …)`（后置 footer） | 有文件待同步，但这份响应没提到它们 | 是 |
+| `⚠ changed on disk after the last index sync`（文件级 header，或响应末尾的引用块） | 发结果时按 stat+hash 发现该文件已漂移：**小文件整份给当前字节**，大文件省略源码并说明原因 | **否** |
+| `⚠️ CodeGraph auto-sync is DISABLED — …`（前置 banner） | watcher 存在，且已**永久 degrade** | 是，且 watcher 对象必须存在 |
+
+**最后一行不等于「所有关掉监听的情况都会提示」——这是最容易搞错的一点。** `CODEGRAPH_NO_WATCH=1` 与
+WSL2 的 `/mnt/*` 走的是 engine 的 `watchDisabledReason` 分支：它只往 stderr 写一行、**不创建 watcher
+对象**，于是 `isWatcherDegraded()` 恒为 false，模型侧一条提示都没有。会 degrade 的是 watcher 已经起来之后
+的**运行期失败**：inotify/EMFILE 配额耗尽、写锁重试超预算、连续 sync 失败超预算。
+
+CLI 回退路径上只有第三类会出现——那条路径的 CodeGraph 实例没有 watcher，「待同步」集合恒为空。
 
 **未索引时 `explore` 先跑 `init`。** 这是自动的，模型不必记得调工具，也不必先问一句：B1 要求「调研代码先
 explore」，而未索引时那句「CodeGraph isn't available here」会让这条指令直接落空。自动索引有两道闸：
@@ -309,8 +321,10 @@ GUI 重发不会重复注入。
   ——查询仍可用，但自动同步失效。升级后要手动停掉旧 daemon。
 - **CLI 的 `sync` 在 daemon 正在同步时可能静默返回空结果**（拿不到 `codegraph.lock`）。所以 `autoSync` 只是
   CLI 回退路径的尽力而为，不是可靠的新鲜度保证；可靠的那条是 watcher。
-- **watcher 会永久 degrade。** WSL2 的 `/mnt`、`CODEGRAPH_NO_WATCH`、inotify 配额耗尽都会让它静默停摆，
-  此时模型只能靠响应里的 staleness banner 察觉。
+- **监听关闭时不一定有提示。** `CODEGRAPH_NO_WATCH=1` 与 WSL2 的 `/mnt/*` 只是不装 watcher、不置 degraded，
+  模型侧收不到任何信号（只有 daemon 的 stderr）。只有**运行期** degrade（inotify/EMFILE 耗尽、写锁重试
+  超预算、连续 sync 失败超预算）才会给出 `⚠️ CodeGraph auto-sync is DISABLED` banner。在这类环境里索引
+  是否新鲜要自己判断——`codegraph_index` 的 `sync`，或看 `codegraph_status` 的 watcher 状态。
 - **CLI 回退路径的自动 sync 在大仓库未测到秒级。** 实测数字来自 2 文件项目（400–535 ms）；大仓库可能显著
   更高。逃生阀是 `autoSync` 开关。
 - **B2 依赖 `codegraph prompt-hook` 这个 hidden 命令**（官方定位 Claude Code 专有）。官方契约是「任何失败

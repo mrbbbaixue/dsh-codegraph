@@ -110,8 +110,9 @@ daemon 模式生效，所以 spawn 时把它作为 tombstone 传下去（`undefi
   目录里的索引文件，**daemon 活着时那个目录删不掉**——测试必须按 pid 停掉它才能清理 fixture。
 - **daemon 与 proxy 版本必须完全相等**；codegraph 升级后旧 daemon 会让新会话降级到进程内只读模式（查询
   可用，自动同步失效）。升级后要手动停旧 daemon。
-- watcher 会永久 degrade（WSL2 的 `/mnt`、inotify 配额、`CODEGRAPH_NO_WATCH`），此后索引静默停更，模型只能
-  靠 banner 察觉。
+- **监听关闭时不一定有提示。** `CODEGRAPH_NO_WATCH=1` 与 WSL2 的 `/mnt/*` 只让 engine 不装 watcher，不置
+  degraded，模型侧收不到任何信号；只有运行期 degrade（inotify/EMFILE 耗尽、写锁重试超预算、连续 sync 失败
+  超预算）才会给出 `⚠️ CodeGraph auto-sync is DISABLED` banner。这类环境里新鲜度要自己判断。
 - 多了一个约 200 行的协议客户端（`lib/session.js`）要维护：帧解析、id 关联、取消、子进程死亡后的重建。
 - B1 从约 1.5 KB 涨到约 4.5 KB，**每请求、每个 subagent 都付**。
 

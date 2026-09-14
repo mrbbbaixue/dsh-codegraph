@@ -15,12 +15,12 @@
 | **`explore`** | 主力查询命令。返回相关符号的逐字源码（按文件分组、带行号）+ 调用路径 + 波及面 | 输出是给 LLM 的 markdown，**没有 `--json`** |
 | **`node`** | 单符号（源码 + caller/callee trail）或整文件（行号 + dependents） | 与内置 `read` 功能重叠，因此不在默认面 |
 | **`init` / `sync` / `index`** | `init`=首次建索引；`sync`=增量；`index`=全量重建。本项目合成一个 `codegraph_index` 工具的三个 operation | 别把 `index`（全量）和 `sync`（增量）当同义词 |
-| **staleness banner** | `explore` 输出里 `⚠ Changed on disk after the last index sync: <file>` | **只覆盖已索引文件的内容漂移**，覆盖不了"新符号静默不可见"（见 ADR-0005） |
-| **MCP 面** | `codegraph serve --mcp` 暴露的工具集合。默认只有 `codegraph_explore`（`DEFAULT_MCP_TOOLS`），可用 `CODEGRAPH_MCP_TOOLS` 加回 | 本项目**不用** MCP，但沿用了它"只给 explore"的结论 |
-| **daemon** | `serve --mcp` 在能解析到 `.codegraph/` 时 connect-or-spawn 的 detached 进程；`.codegraph/` 下留 `daemon.sock`/`.pid`/`.log` | CLI 单次调用**不会**拉起它（实测：调用前后进程数不变） |
-| **watcher** | 文件监听，写入后约 1 s 自动同步。**只有 `serve --mcp` 会起** | 这是 CLI 路线的主要代价，由 `autoSync` 补偿 |
+| **staleness 提示** | 四类，全是 codegraph 服务端发出的：① `⚠️ Some files referenced below were edited since the last index sync`（待同步文件被这份响应提到）② `(Note: … pending index sync …)`（待同步但没被提到）③ `⚠ changed on disk after the last index sync`（发结果时 stat+hash 发现漂移；小文件整份给当前字节，大文件省略源码）④ `⚠️ CodeGraph auto-sync is DISABLED`（watcher 已**永久 degrade**） | ①②④ **需要 watcher**，③不需要。**`CODEGRAPH_NO_WATCH` 与 WSL2 `/mnt` 走 `watchDisabledReason`，不置 degraded、没有任何 banner**（只写 stderr） |
+| **MCP 面** | `codegraph serve --mcp` 暴露的工具集合。默认只**列** `codegraph_explore`，其余 7 个定义着但不列（`CODEGRAPH_MCP_TOOLS` 可开）；本项目 8 个都调，但不列给模型 | 本项目**自己实现 MCP 客户端**（`lib/session.js`），不用 `@deepseek-ai/dsh-mcp-client`（见 ADR-0007） |
+| **daemon** | `serve --mcp` 在能解析到 `.codegraph/` 时 connect-or-spawn 的 detached 进程；`.codegraph/` 下留 `daemon.sock`/`.pid`/`.log`。**watcher 与唯一的 SQLite writer 都在它里面** | 没有「启动 daemon」的 CLI 入口——`codegraph daemon` 只能列出并停掉。插件**不杀**它（可能正在服务别人的 Claude Code） |
+| **watcher** | 挂在 daemon 的 engine 上的文件监听，写入后约 1–2 s（待同步 ≤2 个文件时 300 ms）自动增量同步 | 只存在于 `serve --mcp` 这条路；CLI 单次调用没有它，所以 CLI 回退路径用 `autoSync` 补偿 |
 | **`prompt-hook`** | hidden 命令。stdin `{prompt, cwd}` → stdout `<codegraph_context>` 块。失败静默 exit 0，上限 9000 字符，三级门控 | 官方定位 Claude Code 专有；B2 复用它，靠熔断限制风险 |
-| **`SERVER_INSTRUCTIONS`** | 官方给 agent 的 4.5 KB playbook，通过 MCP `initialize.instructions` 下发 | dsh 的 MCP 客户端**把它整个丢弃了**——这是本项目的立项理由 |
+| **`SERVER_INSTRUCTIONS`** | 官方给 agent 的 4.5 KB playbook，通过 MCP `initialize.instructions` 下发。**本项目把它整段**做成 B1（只改五处在 dsh 里会变成假话的句子） | dsh 的 MCP 客户端把 `instructions` 整个丢弃，所以这段文本只能由插件自己注入——而插件注入的还能到 subagent |
 | **`CODEGRAPH_INSTRUCTIONS_BLOCK`** | installer 写进 `CLAUDE.md`/`AGENTS.md` 的 ~0.9 KB marker 块 | 它存在的原因是 subagent 拿不到 MCP instructions |
 
 ## dsh 侧
@@ -48,8 +48,9 @@
 
 | 术语 | 含义 |
 |---|---|
-| **B1** | 静态提示词注入：`ctx.systemPrompt.section`，每请求固定约 1.5 KB |
+| **B1** | 静态提示词注入：`ctx.systemPrompt.section`，官方 `SERVER_INSTRUCTIONS` **全文**，每请求固定约 4.5 KB |
 | **B2** | 动态前置注入：`agent/pre-step` 里跑 `codegraph prompt-hook`，把 explore 结果塞进当步 |
 | **core 面 / full 面** | `core` = `explore` + `index`；`full` 在其上追加其余 8 个工具 |
-| **解析链** | runner 找 codegraph 的顺序：插件内依赖 → `~/.codegraph/bundles` 缓存 → PATH |
+| **解析链** | runner 找 codegraph 的顺序：配置的 `executable` → 插件内依赖的 shim → 磁盘上的自包含安装 → PATH |
+| **常驻会话** | 每个项目一条长期存活的 `codegraph serve --mcp` 子进程（`lib/session.js`），查询走它的 `tools/call` |
 | **熔断** | B2 的 `prompt-hook` 连续失败 2 次后，本进程内不再尝试（不落盘、不阻塞启动） |
