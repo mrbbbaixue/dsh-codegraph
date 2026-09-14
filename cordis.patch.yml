@@ -1,0 +1,11 @@
+# dsh-codegraph bundle patch.
+#
+# 与 README「安装」一节的手动步骤一致：把插件行插入所选 profile 的 cordis 配置。
+# 声明在 package.json 的 dsh.bundle.patch 中，使 `dsh plugin add` 可直接安装。
+#
+# 装上本插件后，profile 的 cordis.patch.yml 里原有的 mcp-codegraph 行（
+# @deepseek-ai/dsh-mcp-client + `codegraph serve --mcp`）应当移除，否则模型会
+# 同时看到两个近乎同名的工具。迁移步骤见 README「从 MCP 接入迁移」。
+- insert:
+    - id: dsh-codegraph
+      name: '@mrbbbaixue/dsh-codegraph'
