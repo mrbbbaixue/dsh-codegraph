@@ -15,7 +15,7 @@
 | 3 | B1 = `systemPrompt.section`；B2 = `agent/pre-step` 改写 + 官方 `prompt-hook` 门控 | [0003](docs/adr/ADR-0003-two-layer-prompt-injection.md) |
 | 4 | 工具面 `core` = `explore` + `index`；`full` 追加 8 个 | [0004](docs/adr/ADR-0004-tool-surface-explore-and-index.md) |
 | 5 | 查询前自动 `sync`；`init`/`index` 走 `ask` 审批，`sync` 放行 | [0005](docs/adr/ADR-0005-index-lifecycle.md) |
-| 6 | 零构建单包；手写 client bundle；设置卡片 3 个开关（无状态行） | [0006](docs/adr/ADR-0006-plugin-shape-and-settings-card.md) |
+| 6 | 零构建单包；手写 client bundle；设置面板承载全部 7 个设置（无状态行） | [0006](docs/adr/ADR-0006-plugin-shape-and-settings-card.md) |
 
 ---
 
@@ -28,7 +28,7 @@ lib/
   index.js            入口：Config / apply / 工具注册 / B1 section / B2 pre-step / 审批门禁
   guide.js            B1 提示词文本（独立文件，便于评审与改文案）
   runner.js           进程执行：解析链、Windows shim 分支、超时、输出收集、错误归一
-  client.js           浏览器半边：设置卡片（手写，React.createElement）
+  client.js           浏览器半边：设置面板（手写，React.createElement）
 README.md
 docs/
   adr/                ADR-0001..0006 + 索引
@@ -81,12 +81,12 @@ export const Config = z.object({
   surface: z.union([z.const('core'), z.const('full')]).default('core'),
   autoSync: z.boolean().default(true),
   executable: z.string().default('codegraph'),
-  exploreTimeoutMs: z.number().default(120000),
-  indexTimeoutMs: z.number().default(900000),
+  exploreTimeoutMs: z.natural().min(1).default(120000),
+  indexTimeoutMs: z.natural().min(1).default(900000),
 })
 ```
 
-前三个是**设置卡片上的开关**，因此实际生效值必须走 `ctx.settings` 解析后的结果，不能只用 `apply(ctx, config)` 的入参（那个是组装默认值）。
+前三个是**设置面板行为段里的开关**，因此实际生效值必须走 `ctx.settings` 解析后的结果，不能只用 `apply(ctx, config)` 的入参（那个是组装默认值）。七个字段全部上卡片，组装层只是这批值的默认来源。
 
 ### 2.2 runner
 
@@ -184,11 +184,13 @@ window.__ModuleLoader__.load({
 
 - `NS` 必须与 host 侧 `ctx.settings.register(NS, Schema)` 的 namespace **完全一致**——它是唯一的 join key。
 - 实现前先对照任一已装 `dsh-context` 的 profile：`~/.dsh/profiles/<profile>/node_modules/dsh-context/lib/client.js`（其 9761–9790 行是完整可抄的注册骨架）。
-- 卡片只放三个开关；**不放状态行**（理由见 ADR-0006）。
+- 面板是设置页其它插件卡片同形的 `<li>`：标题行开合，面板内分段列出全部 7 个字段，底部撤销/放弃/保存；写入是暂存式、带 revision 的一次 mutation。**不放状态行**（理由见 ADR-0006）。
 
 ---
 
 ## 3. 实施阶段
+
+下面只是阶段与验收的骨架。**逐文件、逐接口的编写顺序见 [`docs/IMPL-PLAN.md`](docs/IMPL-PLAN.md)**（含实测环境、宿主 API 的 `file:line` 契约、以及本文未覆盖的 8 个坑）。
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
@@ -197,7 +199,7 @@ window.__ModuleLoader__.load({
 | **P2** runner + 两个工具 | `lib/runner.js`（解析链、Windows 分支、超时、错误归一）；`explore` / `index`；自动 `sync` | Windows 上 `explore` 返回真实源码；未索引时错误文案可读；取消能杀掉进程；`autoSync: false` 后行为退化但可用 |
 | **P3** 审批门禁 | `tools/pre-execute` 的 `ask`；路径白名单 | `init` 弹审批；拒绝后不建索引；`sync` 不弹 |
 | **P4** B2 | `agent/pre-step` + `prompt-hook` + 去重 + 熔断 | 结构性 prompt 注入 `<codegraph_context>`；非结构性静默；同文重发不重复；超时 3 s 后放弃不拖 turn |
-| **P5** 设置卡片 | `lib/client.js` + `dsh.client` + host 侧 `settings.register` | 设置页出现 CodeGraph 卡片，三个开关可存可重置；值落 `~/.dsh/settings.yaml` |
+| **P5** 设置面板 | `lib/client.js` + `dsh.client` + host 侧 `settings.register` | 设置页出现 CodeGraph 面板，7 个字段可存可放弃可重置；值落 `~/.dsh/settings.yaml` |
 | **P6** full 面 | 其余 8 个工具 | 每个工具一次真实调用 |
 | **P7** 收尾 | 补 README：Model Experience、已知限制、**从 MCP 接入迁移的说明**（装了本插件后可有可无地移除既有 `mcp-codegraph` 行） | README 能让新用户独立完成安装、迁移与排障 |
 
@@ -249,5 +251,5 @@ window.__ModuleLoader__.load({
 - 不 import SDK：宿主 Node 版本不确定、同步 sqlite 阻塞主线程、无 `exports`。
 - 不做 MCP server、不做 HTTP server、不做浏览器查看器。
 - 不做后台 watcher。
-- 不在设置卡片上放状态行，也不放可执行文件路径与超时（留在 `cordis.patch.yml`）。
+- 不在设置面板上放状态行（理由见 ADR-0006）。
 - 不自动 `init`。

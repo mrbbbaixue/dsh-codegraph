@@ -2,6 +2,7 @@
 
 - 状态：已接受
 - 日期：2026-09-14
+- 修订：2026-09-15（见文末「修订记录」）
 
 ## 背景
 
@@ -86,3 +87,53 @@ window.__ModuleLoader__.load({
 - **无 scope 的 `dsh-codegraph-cli` / `dsh-tool-codegraph` / `dsh-codegraph-plugin`**：都可用，但用户选了 scope。
 - **走官方 tsdown 预设**：预设不在已发布的包里，等于要自己复刻构建配置，比手写更重。
 - **不写 client 半边，只做 host**：设置页不会出现任何东西，不满足需求。
+
+## 修订记录
+
+### 2026-09-15：面板成形，全部字段上卡片
+
+**起因**：用户反馈「设置散落在外面」——卡片上是散装的一行行控件而不是设置页其它插件那样的卡片，
+且 `autoSync` / `executable` / 两个超时只能靠改 `cordis.patch.yml` 才能看见和改。
+
+**改了什么**（本节覆盖上文与之冲突的部分）：
+
+- **卡片改成真正的面板**：一个 `<li>`，标题行（名称 + 一句话说明 + chevron）负责开合，面板内按「行为 /
+  高级」分段排列控件，底部是「全部恢复默认 / 放弃修改 / 保存」。样式用主题变量复刻设置页其它卡片的
+  观感，仍不引入 `dsh-client-ui-primitives`（图标用一枚内联 SVG chevron）。
+- **七个字段全部上卡片**：上表的三项之外，`autoSync`、`executable`、`exploreTimeoutMs`、
+  `indexTimeoutMs` 也进面板。它们仍然是组装层可配的同一个 schema，`cordis.patch.yml` 保留为部署默认值，
+  面板只是多了一条更近的写入路径（并自带「清空即撤掉覆盖」的回退手势）。
+- **写入改成暂存式**：原来是每改一个控件立刻写一次。现在控件改的是草稿，保存时以**一次** mutation 提交，
+  并带上读取草稿时的 revision——期间别处改过设置就整批拒绝，而不是静默覆盖。数值草稿不是正整数毫秒时
+  保存被挡住，不把注定被 Host 校验拒绝的值发出去。
+
+**没变的部分**（上文仍然有效）：包名、零构建手写 client bundle、host 与 browser 以 settings namespace
+为 join key、**不放索引状态行**——理由（卡片拿不到会话/工作区上下文）与本决定无关，依然成立。
+
+**新增的负面**：面板仍是手写 bundle，面板内部结构（字段表、样式、控件）只由 `test/run-plugin-test.mjs`
+里的客户端断言守着；格式契约漂移依旧是「静默不出现」而不是报错。此外，面板写的是**全局** settings
+namespace，所以 `executable` 这类本质属于部署的值进了用户层——同一台机器上多 profile 共用一份
+`~/.dsh/settings.yaml` 时，一处改动会影响所有 profile。
+
+### 2026-09-15（续）：控件与观感对齐设置页自身
+
+**起因**：用户要求「控件样式符合官方效果，勾选改成开关，默认收缩」。
+
+**改了什么**：
+
+- **改用官方原语**：`require('@deepseek-ai/dsh-client-ui-primitives')` 取 `Switch` 与
+  `IconChevronDownOutline14`。这一条**推翻上文「Deliberately not used」的判断**——当时认为该包不受
+  node_modules 供给，事实相反：它是浏览器模块表里的正式条目（`react`、`dsh-client-store`、
+  `dsh-client-ui-slots`、`dsh-client-ui-dockkit` 与它并列），`dsh-context` 也正从那里取 `Menu` 与图标。
+  勾选框因此变成官方的 `role="switch"`，与设置页其它卡片完全同形。
+- **控件度量对齐**：字段行、label、重置、输入框、hint、页脚按钮的尺寸与颜色改用
+  `dsh-client-ui-settings-plugins` 自己的 `fields.module.css` / `PluginCard.module.css` 度量，只是换了
+  本插件前缀。文本与数值字段改为**标签一行、控件整行在下方**（官方 `ValueField` 的版式），
+  `surface` 与开关才与标签同行。
+- **默认收缩**：`open` 初值为 `false`，与设置页其它卡片一致。
+- **去掉分段标题与「全部恢复默认」**：官方卡片里没有分组标题，重置是**每个字段**右上的一个文字按钮，
+  只在用户层带该字段时出现。面板照做，`unset` 单字段的工具函数因此与手动清空再保存等价。
+- **打开态可测**：面板接受一个可选的 `defaultOpen`，只为让渲染型测试够得到展开后的主体；设置页传空
+  props，仍是收缩态。
+
+**没变的部分**：包名、零构建、namespace join key、暂存式写入与 revision 栅、不放状态行。
