@@ -321,6 +321,16 @@ await test('every tool declares a positive finite timeoutMs', async () => {
   }
 })
 
+await test('the explore budget admits an automatic index only while autoIndex is on', async () => {
+  const on = createStubContext()
+  plugin.apply(on.ctx, plugin.Config({ exploreTimeoutSec: 1, indexTimeoutSec: 9 }))
+  assert.equal(on.record.tools.get('codegraph_explore').timeoutMs, 10_000)
+
+  const off = createStubContext()
+  plugin.apply(off.ctx, plugin.Config({ exploreTimeoutSec: 1, indexTimeoutSec: 9, autoIndex: false }))
+  assert.equal(off.record.tools.get('codegraph_explore').timeoutMs, 1_000)
+})
+
 await test('every tool renders a text block from its string value', async () => {
   const { ctx, record } = createStubContext()
   plugin.apply(ctx, plugin.Config({ surface: 'full' }))
@@ -412,9 +422,68 @@ await test('a settings change re-derives the whole surface without duplicate err
 await test('an unusable timeout is refused at the write, not at registration', async () => {
   const { ctx, record } = createStubContext({ settings: plugin.Config({}) })
   plugin.apply(ctx, plugin.Config({}))
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutMs: 0, indexTimeoutMs: 1 }), /positive/)
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutMs: 1, indexTimeoutMs: -5 }), /positive/)
-  assert.doesNotThrow(() => record.settingsHooks.validate({ exploreTimeoutMs: 1, indexTimeoutMs: 1 }))
+  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 0, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }), /positive/)
+  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: -5, autoIndexMaxFiles: 10_000 }), /positive/)
+  assert.doesNotThrow(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }))
+  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 0 }), /positive whole number of files/)
+  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 1.5 }), /positive whole number of files/)
+  assert.doesNotThrow(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }))
+})
+
+await test('an unindexed workspace is indexed before the first query runs', async () => {
+  const bare = mkdtempSync(join(tmpdir(), 'cg-autoinit-'))
+  try {
+    const scripted = createScriptedSubprocess(() => ({ stdout: 'sample' }))
+    const { ctx, record } = createStubContext({ subprocess: scripted })
+    plugin.apply(ctx, plugin.Config({}))
+
+    const output = await record.tools.get('codegraph_explore').execute({ query: 'anything' }, executionFor(bare))
+    assert.equal(scripted.calls.length, 2, 'expected one init and then the query')
+    assert.equal(scripted.calls[0].argv.includes('init'), true, `first call was not init: ${scripted.calls[0].argv.join(' ')}`)
+    assert.equal(scripted.calls[0].argv.at(-2), '-y')
+    assert.equal(scripted.calls[0].argv.at(-1), bare)
+    assert.equal(scripted.calls[1].argv.includes('explore'), true, 'the query itself never ran')
+    assert.match(output, /built one automatically/u)
+    assert.match(output, /sample/u, 'the query output must survive the note')
+  } finally {
+    rmSync(bare, { recursive: true, force: true })
+  }
+})
+
+await test('a project past the file ceiling is left to the model and the user', async () => {
+  const big = mkdtempSync(join(tmpdir(), 'cg-toobig-'))
+  try {
+    mkdirSync(join(big, 'src'), { recursive: true })
+    writeFileSync(join(big, 'src', 'a.ts'), 'export const a = 1\n')
+    writeFileSync(join(big, 'src', 'b.ts'), 'export const b = 2\n')
+
+    const scripted = createScriptedSubprocess(() => ({ stdout: '' }))
+    const { ctx, record } = createStubContext({ subprocess: scripted })
+    plugin.apply(ctx, plugin.Config({ autoIndexMaxFiles: 1 }))
+
+    const output = await record.tools.get('codegraph_explore').execute({ query: 'anything' }, executionFor(big))
+    assert.equal(scripted.calls.length, 1, 'the ceiling must stop the automatic build')
+    assert.equal(scripted.calls[0].argv.includes('explore'), true)
+    assert.match(output, /autoIndexMaxFiles/u)
+    assert.match(output, /operation=init/u)
+  } finally {
+    rmSync(big, { recursive: true, force: true })
+  }
+})
+
+await test('autoIndex:false never builds an index on its own', async () => {
+  const bare = mkdtempSync(join(tmpdir(), 'cg-noauto-'))
+  try {
+    const scripted = createScriptedSubprocess(() => ({ stdout: 'sample' }))
+    const { ctx, record } = createStubContext({ subprocess: scripted })
+    plugin.apply(ctx, plugin.Config({ autoIndex: false }))
+
+    await record.tools.get('codegraph_explore').execute({ query: 'anything' }, executionFor(bare))
+    assert.equal(scripted.calls.length, 1, 'autoIndex:false must leave the query alone')
+    assert.equal(scripted.calls[0].argv.includes('init'), false)
+  } finally {
+    rmSync(bare, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -784,16 +853,13 @@ if (cliAvailable) {
     assert.match(output, /deltaProbe/u, `the auto-sync did not pick up the new symbol: ${output.slice(0, 400)}`)
   })
 
-  await test('a query in an unindexed directory reports rather than throws raw', async () => {
+  await test('a query in an unindexed directory indexes it and answers', async () => {
     const bare = mkdtempSync(join(tmpdir(), 'cg-noindex-'))
     try {
-      const bareExec = executionFor(bare)
-      try {
-        const output = await exploreTool.execute({ query: 'anything' }, bareExec)
-        assert.match(output, /isn't available here|not available here/iu)
-      } catch (error) {
-        assert.match(String(error.message), /isn't available here|not available here|CodeGraph not initialized/iu)
-      }
+      writeFileSync(join(bare, 'delta.ts'), 'export function bareSymbol(): number {\n  return 7;\n}\n')
+      const output = await exploreTool.execute({ query: 'bareSymbol' }, executionFor(bare))
+      assert.ok(existsSync(join(bare, '.codegraph', 'codegraph.db')), `no index was written: ${output.slice(0, 400)}`)
+      assert.match(output, /bareSymbol/u, `the automatic index did not surface the symbol: ${output.slice(0, 400)}`)
     } finally {
       rmSync(bare, { recursive: true, force: true })
     }
@@ -823,6 +889,10 @@ function loadClientBundle() {
   const source = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
   let entry
   const sandbox = {
+    // The panel's debounced writes use these; a browser global the VM sandbox
+    // does not carry by default.
+    setTimeout,
+    clearTimeout,
     window: {
       __ModuleLoader__: {
         load: (loaded) => {
@@ -847,7 +917,13 @@ function stubRequire() {
   const IconChevronDownOutline14 = (props) => ({ type: 'svg', props, children: [] })
   const Switch = (props) => ({
     type: 'button',
-    props: { type: 'button', role: 'switch', 'aria-checked': props.checked, disabled: props.disabled },
+    props: {
+      type: 'button',
+      role: 'switch',
+      'aria-checked': props.checked,
+      disabled: props.disabled,
+      onChange: props.onChange,
+    },
     children: [],
   })
   return (id) => {
@@ -857,6 +933,7 @@ function stubRequire() {
       createElement: (type, props, ...children) => ({ type, props, children }),
       useState: (initial) => [initial, () => {}],
       useEffect: () => {},
+      useRef: (initial) => ({ current: initial }),
       useSyncExternalStore: (subscribe, getSnapshot) => {
         subscribe(() => {})
         return getSnapshot()
@@ -890,12 +967,20 @@ function elementsWith(node, prop) {
 /**
  * One rendered field: its name and the control it carries. A toggle's control is
  * the primitive `Switch`; a select or a text field is a DOM element. The label,
- * the hint, and the per-field reset are chrome, not controls.
+ * the hint, the per-field reset, and the wrapper that pairs a number with its
+ * unit are chrome, not controls.
  * @param field - the field row element.
  * @returns the field's name and control.
  */
 function fieldControl(field) {
-  const chrome = new Set(['codegraph-head-row', 'codegraph-label', 'codegraph-hint', 'codegraph-invalid', 'codegraph-reset'])
+  const chrome = new Set([
+    'codegraph-head-row',
+    'codegraph-label',
+    'codegraph-hint',
+    'codegraph-invalid',
+    'codegraph-reset',
+    'codegraph-number',
+  ])
   const controls = []
   const visit = (node) => {
     if (Array.isArray(node)) {
@@ -939,28 +1024,56 @@ function fieldHasReset(field) {
 }
 
 /**
+ * The controls of a rendered panel, keyed by field, read exactly the way the
+ * field inventory reads them, so the tests cannot disagree about which element
+ * is a field's control.
+ * @param rendered - the panel's rendered element.
+ * @returns a map from field name to control element.
+ */
+function controlsOf(rendered) {
+  return new Map(
+    elementsWith(rendered, 'data-field').map((field) => {
+      const { field: name, control } = fieldControl(field)
+      return [name, control]
+    }),
+  )
+}
+
+/**
+ * Render the registered card with a client scope that records every write.
+ * @returns the panel component and the client context.
+ */
+function renderPanel() {
+  const exported = loadClientBundle().factory(stubRequire())
+  const client = createClientContext()
+  exported.apply(client.ctx)
+  return { client, panel: client.captured[0].component({}).type }
+}
+
+/**
  * A client cordis context recording the card registration.
  * @returns the context and what it captured.
  */
 function createClientContext() {
   const captured = []
-  const mutations = []
+  const writes = []
   let boundNamespace
   const scope = {
     getSnapshot: () => ({
       status: 'ready',
-      value: { ...fullConfig, exploreTimeoutMs: 60_000 },
+      value: { ...fullConfig, exploreTimeoutSec: 60 },
       base: { ...fullConfig },
-      user: { exploreTimeoutMs: 60_000 },
+      user: { exploreTimeoutSec: 60 },
       revision: 7,
       writable: true,
       mode: 'host',
     }),
     subscribe: () => () => {},
-    set: async () => {},
-    unset: async () => {},
-    mutate: async (ops, revision) => {
-      mutations.push({ ops, revision })
+    set: async (field, value) => {
+      writes.push({ op: 'set', field, value })
+    },
+    unset: async (field) => {
+      writes.push({ op: 'unset', field })
     },
   }
   const slots = {
@@ -991,7 +1104,7 @@ function createClientContext() {
       })
     },
   }
-  return { ctx, captured, mutations, get boundNamespace() { return boundNamespace } }
+  return { ctx, captured, writes, get boundNamespace() { return boundNamespace } }
 }
 
 /** The whole settings schema at its defaults, as the Host resolves an empty composition entry. */
@@ -1050,7 +1163,7 @@ await test('the panel renders every setting the plugin exposes', () => {
   // Every field the Host's schema declares, and no field it does not.
   assert.deepEqual(
     Object.keys(fullConfig).sort(),
-    ['autoSync', 'executable', 'exploreTimeoutMs', 'frontload', 'guide', 'indexTimeoutMs', 'surface'].sort(),
+    ['autoIndex', 'autoIndexMaxFiles', 'autoSync', 'executable', 'exploreTimeoutSec', 'frontload', 'guide', 'indexTimeoutSec', 'surface'].sort(),
   )
 })
 
@@ -1065,10 +1178,10 @@ await test('the open panel renders one official control per field', () => {
   const rows = elementsWith(panel({ defaultOpen: true }), 'data-field').map(fieldControl)
   assert.deepEqual(
     rows.map((row) => row.field),
-    ['guide', 'frontload', 'surface', 'autoSync', 'executable', 'exploreTimeoutMs', 'indexTimeoutMs'],
+    ['guide', 'frontload', 'surface', 'autoSync', 'autoIndex', 'autoIndexMaxFiles', 'executable', 'exploreTimeoutSec', 'indexTimeoutSec'],
   )
   for (const row of rows) {
-    const isToggle = row.field === 'guide' || row.field === 'frontload' || row.field === 'autoSync'
+    const isToggle = row.field === 'guide' || row.field === 'frontload' || row.field === 'autoSync' || row.field === 'autoIndex'
     if (isToggle) {
       assert.equal(row.control.type, 'button', `${row.field} renders the primitive switch`)
       assert.equal(row.control.props.role, 'switch')
@@ -1079,29 +1192,64 @@ await test('the open panel renders one official control per field', () => {
   }
 })
 
-await test('a control shows the composed value and stages through its writer', () => {
-  const exported = loadClientBundle().factory(stubRequire())
-  const client = createClientContext()
-  exported.apply(client.ctx)
-  const panel = client.captured[0].component({}).type
+await test('a control shows the composed value and carries a writer', () => {
+  const { panel } = renderPanel()
   const rendered = panel({ defaultOpen: true })
 
-  // Read the controls the same way the field inventory does, so the tests cannot
-  // disagree about which element is a field's control.
-  const controls = new Map(elementsWith(rendered, 'data-field').map((field) => {
-    const { field: name, control } = fieldControl(field)
-    return [name, control]
-  }))
-  // The scope serves a user override for `exploreTimeoutMs`, so the number
+  const controls = controlsOf(rendered)
+  // The scope serves a user override for `exploreTimeoutSec`, so the number
   // control shows it over the composition base; the switch reports the base
   // through the primitive's own `aria-checked`.
-  assert.equal(controls.get('exploreTimeoutMs').props.value, '60000')
+  assert.equal(controls.get('exploreTimeoutSec').props.value, '60')
   assert.equal(controls.get('autoSync').props['aria-checked'], true)
   // A user override also buys the field's own reset — the section's per-field
   // gesture — while an untouched field has none.
   const rowOf = (name) => elementsWith(rendered, 'data-field').find((f) => f.props['data-field'] === name)
-  assert.equal(fieldHasReset(rowOf('exploreTimeoutMs')), true)
+  assert.equal(fieldHasReset(rowOf('exploreTimeoutSec')), true)
   assert.equal(fieldHasReset(rowOf('guide')), false)
+})
+
+await test('the panel has no save button: toggles and selects write on change', () => {
+  const { client, panel } = renderPanel()
+  const rendered = panel({ defaultOpen: true })
+
+  const buttons = elementsWith(rendered, 'className').map((node) => node.props.className)
+  assert.equal(buttons.includes('codegraph-save'), false, 'the save button should be gone')
+  assert.equal(buttons.includes('codegraph-discard'), false, 'nothing is staged, so nothing is discardable')
+
+  const controls = controlsOf(rendered)
+  controls.get('autoSync').props.onChange(false)
+  controls.get('surface').props.onChange({ target: { value: 'full' } })
+  assert.deepEqual(client.writes, [
+    { op: 'set', field: 'autoSync', value: false },
+    { op: 'set', field: 'surface', value: 'full' },
+  ])
+})
+
+await test('a text control writes once typing settles, and an emptied one withdraws the override', () => {
+  const { client, panel } = renderPanel()
+  const rendered = panel({ defaultOpen: true })
+  const controls = controlsOf(rendered)
+
+  const executable = controls.get('executable')
+  assert.equal(typeof executable.props.onBlur, 'function', 'a text control must settle when it is left')
+  executable.props.onChange({ target: { value: '  C:\\tools\\codegraph.exe  ' } })
+  assert.deepEqual(client.writes, [], 'typing alone must not write')
+  executable.props.onBlur()
+  assert.deepEqual(client.writes, [{ op: 'set', field: 'executable', value: 'C:\\tools\\codegraph.exe' }])
+
+  const timeout = controls.get('exploreTimeoutSec')
+  timeout.props.onChange({ target: { value: 'not a number' } })
+  timeout.props.onBlur()
+  assert.equal(client.writes.length, 1, 'a draft the Host would reject must not be written')
+
+  timeout.props.onChange({ target: { value: '   ' } })
+  timeout.props.onBlur()
+  assert.deepEqual(client.writes.at(-1), { op: 'unset', field: 'exploreTimeoutSec' })
+
+  executable.props.onChange({ target: { value: '' } })
+  executable.props.onBlur()
+  assert.deepEqual(client.writes.at(-1), { op: 'unset', field: 'executable' })
 })
 
 // ---------------------------------------------------------------------------

@@ -19,11 +19,12 @@ dsh 已经能用 codegraph——通过 MCP。写这个插件不是为了「能�
    `instructions` 字段，这段文本从来没进过模型上下文。插件把它做成 `systemPrompt.section`，每个请求都在，
    **subagent 也在**。
 2. **没有自举能力。** MCP 默认只暴露 `codegraph_explore`；未索引时官方口径是「indexing is your decision」，
-   不代跑 `init`。插件补上 `codegraph_index`，并让 `init`/`index` 弹审批，把决定权交回给用户。
+   不代跑 `init`。插件补上 `codegraph_index`，并且**第一次查询发现没有索引就直接建**（`autoIndex`，文件数
+   上限 `autoIndexMaxFiles`，默认 1 万）；模型自己发起的 `init`/`index` 仍然弹审批。
 
 另外：CLI 子进程不拉常驻 daemon，`serve --mcp` 会。
 
-代价是失去 watcher，由 **查询前自动 `sync`** 补偿（见下）。
+代价是失去 watcher，由**查询前自动 `sync`** 与**未索引时的自动 `init`** 补偿（见下）。
 
 ---
 
@@ -90,7 +91,7 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
 ## 设置
 
 **设置 ▸ 插件 ▸ 插件配置 ▸ CodeGraph** 是一张和设置页其它插件卡片同形的面板：默认收缩，标题行（名称 +
-一句话说明 + chevron）展开后是全部七个设置，底部是放弃修改与保存。
+一句话说明 + chevron）展开后是全部九个设置。**没有保存按钮**：控件一改就写。
 
 | 字段 | 控件 | 默认 | 作用 |
 |---|---|---|---|
@@ -98,19 +99,22 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
 | `frontload` | 开关 | 开 | B2：结构性提问时在进入本轮前预取代码上下文 |
 | `surface` | 下拉 | `core` | 工具面：`core`（2 个）或 `full`（10 个） |
 | `autoSync` | 开关 | 开 | `explore` 之前跑一次增量 `sync` |
+| `autoIndex` | 开关 | 开 | 第一次查询发现工作区没有 `.codegraph/`，直接跑 `init` |
+| `autoIndexMaxFiles` | 数字框 | 10000 | 项目文件数超过它就**不再**自动建索引，改由模型/用户决定 |
 | `executable` | 文本框 | `codegraph` | 显式指定运行时；留空即自动搜索 |
-| `exploreTimeoutMs` | 数字框 | 120000 | 单次 `explore` 的上限 |
-| `indexTimeoutMs` | 数字框 | 900000 | `init` / `index` / `sync` 的上限 |
+| `exploreTimeoutSec` | 数字框 | 120 | 单次 `explore` 的上限（秒） |
+| `indexTimeoutSec` | 数字框 | 900 | `init` / `index` / 自动建索引的上限（秒） |
 
 开关与下拉是设置的官方原语（`@deepseek-ai/dsh-client-ui-primitives` 的 `Switch`、与设置页同一套度量），
 不是自绘的勾选框。
 
-保存**热生效**：改完立刻按新值重注册工具与指引，不需要重启。
+写入**热生效**：开关与下拉一改就写，工具与指引立刻按新值重注册，不需要重启。
 
-写入是**暂存式**的：控件改的是草稿，点保存才以一次变更提交，并带上读取时的 revision——期间别处改过
-设置就整批拒绝，而不是覆盖。数值字段的草稿不是正整数毫秒时保存按钮禁用，因为 Host 侧的校验会拒绝它。
-清空 `executable` 或某个超时并保存，等于撤掉这条用户覆盖，回落该部署的组装默认值；某字段已被覆盖时，
-它那一行右上会出现一个**重置**，按一下就能只撤掉这一个字段。
+文本与数值框在停手 400ms 后写入，离开输入框即时写入——面板上显示的永远是设置文档里的值，没有暂存与
+保存这一步。写入走 `settingsScope` 的 `set` / `unset`：每次带最新 revision，快速连改按顺序落盘，所以
+既不会把别处的改动覆盖掉，也不会漏掉最后一下。数字框后面跟着单位（秒 / 个文件），不是正整数的草稿不会写
+出去，Host 侧的校验会拒绝它。清空 `executable` 或某个超时，等于撤掉这条用户覆盖，回落该部署的组装默认值；
+某字段已被覆盖时，它那一行右上会出现一个**重置**，按一下就能只撤掉这一个字段。
 
 面板上不放索引状态行，这是有意的：`codegraph status` 不带 `-p` 时读的是进程 cwd，而索引按项目根存放，
 设置卡片拿不到会话/工作区上下文——那一行显示的会是「dsh 服务进程启动目录」的索引状态，与你在哪个项目
@@ -127,17 +131,20 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
       name: '@mrbbbaixue/dsh-codegraph'
       config:
         autoSync: true            # 查询前自动 sync（默认开）
+        autoIndex: true           # 未索引时自动 init（默认开）
+        autoIndexMaxFiles: 10000  # 超过这么多文件就不自动 init
         executable: codegraph     # 指定 codegraph 运行时；默认 codegraph 表示"自动搜索"
-        exploreTimeoutMs: 120000
-        indexTimeoutMs: 900000
+        exploreTimeoutSec: 120     # explore 上限（秒）
+        indexTimeoutSec: 900       # init / index / 自动索引上限（秒）
 ```
 
-`autoSync` 是「自动 sync 在大仓库可能到秒级」这个风险的逃生阀；`executable` 一旦配置就**优先于**自动搜索。
-两条路等价，选哪条看值该属于谁：该 profile 的所有会话共用就写 YAML，只属于你就写面板。
+`autoSync` 是「自动 sync 在大仓库可能到秒级」这个风险的逃生阀；`autoIndexMaxFiles` 是「自动全量索引在超大
+仓库可能跑很久」这个风险的逃生阀；`executable` 一旦配置就**优先于**自动搜索。两条路等价，选哪条看值该属于谁：
+该 profile 的所有会话共用就写 YAML，只属于你就写面板。
 
 ---
 
-## 查询前自动 sync
+## 索引生命周期：自动 sync 与自动 init
 
 CLI 路径没有 watcher。实测后果不是「结果旧一点」，而是：
 
@@ -150,7 +157,22 @@ CLI 路径没有 watcher。实测后果不是「结果旧一点」，而是：
 所以 `codegraph_explore` 执行前会跑一次 `sync`（增量，实测 400–500 ms）。
 
 `sync` 失败**不会**让查询失败：降级为「继续查询 + 标注索引可能陈旧」，这样只读项目仍可用。
-若工作区根本没有索引，则跳过 `sync`——此时 `explore` 自己的「CodeGraph isn't available here」才是该给模型看的。
+
+**工作区没有索引时，`explore` 先跑 `init`。** 这是自动的，模型不必记得调工具，也不必先问一句：B1 要求
+「调研代码先 explore」，而未索引时那句「CodeGraph isn't available here」会让这条指令直接落空。自动索引有
+两道闸：
+
+1. `autoIndex`（默认开）——关掉就回到「模型告知用户、由审批门禁决定」的老路径。
+2. `autoIndexMaxFiles`（默认 10000）——文件数超过上限就不建，返回一条说明让模型去调 `codegraph_index`。
+   计数只走目录树，跳过 `.` 开头的目录与 `node_modules`，并且**一旦超过上限立刻停止遍历**，所以判断本身
+   只是几次 `readdir`。
+
+`init` 失败（运行时缺失、只读目录、超时）会让这次 `explore` 直接失败并带上原因——索引建不出来时，含糊的
+空结果比错误更糟。同一个根目录上并发发起的多个 `explore` 共用一次 `init`，不会互抢同一个索引文件。
+
+预算上，自动 `init` 走 `indexTimeoutSec` 这一档（与 `codegraph_index` 的 `init` / `index` 相同），而这一次
+`explore` 调用的整体上限是 `exploreTimeoutSec + indexTimeoutSec`——否则默认两分钟的查询预算会把一次合法的
+全量索引掐死。`autoIndex` 关掉时，`explore` 的上限回到 `exploreTimeoutSec`。
 
 ---
 
@@ -209,7 +231,7 @@ schema，也是每请求固定成本。
 #### KV Cache effect
 
 前缀稳定、追加式。同一段文本每请求都以相同位置出现，不使已有可复用前缀失效。以下情况会改变请求、从而
-影响复用：`guide` 开关切换、`surface` 在 core/full 之间切换（工具 schema 集合变化）、`exploreTimeoutMs`
+影响复用：`guide` 开关切换、`surface` 在 core/full 之间切换（工具 schema 集合变化）、`exploreTimeoutSec`
 等被改写（工具定义重注册）。
 
 ### Frontloaded prompt context (B2)
@@ -267,10 +289,12 @@ GUI 重发不会重复注入。
   注意 settings namespace 恰好相反：schema 只接受小写字母/数字/连字符，`@` 与 `/` 会被注册直接拒绝。
 - **不支持 deferred tool。** dsh 没有 MCP 那种「列出但不加载」的中间态，所以 `surface` 的含义比官方语境更硬：
   不给 schema 就等于彻底不可用。
-- **不自动 `init`。** 未索引时 `explore` 报「isn't available here」，由用户决定是否 `codegraph_index`。
-  这与官方口径一致；本插件唯一的有意偏离是**提供**自举工具，而是否执行仍由审批门禁交回用户。
+- **首次查询会自动建索引**（`autoIndex` 默认开，文件数不超过 `autoIndexMaxFiles`）。这推翻 ADR-0005 早先
+  「不自动 init」的决定（见该 ADR 的修订记录）：未索引时 `explore` 报「isn't available here」，B1 里
+  「有问题先 explore」的指令就落空了。超过文件数上限、`autoIndex` 关掉或 `init` 失败时，才回到
+  「模型告知用户 + 审批门禁」的路径。
 - **`init` 会传 `-y`。** `codegraph init` 默认交互式；在管道里不带 `-y` 会一直挂在提示上直到超时。
-  同时 `init` 不接受 `--force`，家目录/根目录路径直接拒绝。
+  自动索引与工具调用走的是同一条命令。同时 `init` 不接受 `--force`，家目录/根目录路径直接拒绝。
 
 ---
 

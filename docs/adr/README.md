@@ -8,7 +8,7 @@
 | [ADR-0002](ADR-0002-codegraph-runtime-provisioning.md) | codegraph 运行时的获取方式 | 声明 npm 依赖 + 三级解析回退链；磁盘开销省不掉 |
 | [ADR-0003](ADR-0003-two-layer-prompt-injection.md) | 两层提示词注入（B1 + B2） | B1 走 `systemPrompt.section`；B2 走 `agent/pre-step`（`PromptContext` 用不了） |
 | [ADR-0004](ADR-0004-tool-surface-explore-and-index.md) | 工具面收敛到 explore + index | 官方实测背书"一个强工具胜过一菜单窄工具"；`index` 是有意偏离 |
-| [ADR-0005](ADR-0005-index-lifecycle.md) | 索引生命周期 | 查询前自动 `sync`；`init`/`index` 走审批；新符号静默不可见是核心风险 |
-| [ADR-0006](ADR-0006-plugin-shape-and-settings-card.md) | 插件形态、包名与设置卡片 | `@mrbbbaixue/dsh-codegraph`；零构建；手写 client bundle；一张两段式面板承载全部 7 个设置（无状态行） |
+| [ADR-0005](ADR-0005-index-lifecycle.md) | 索引生命周期 | 查询前自动 `sync`；未索引时自动 `init`（文件数上限默认 1 万）；工具发起的 `init`/`index` 走审批；新符号静默不可见是核心风险 |
+| [ADR-0006](ADR-0006-plugin-shape-and-settings-card.md) | 插件形态、包名与设置卡片 | `@mrbbbaixue/dsh-codegraph`；零构建；手写 client bundle；一张面板承载全部 9 个设置（无状态行，无保存按钮） |
 
 术语先查 [术语表](../glossary.md)。阶段与架构见 [PLAN.md](../../PLAN.md)，逐文件的编写顺序见 [编写计划](../IMPL-PLAN.md)。

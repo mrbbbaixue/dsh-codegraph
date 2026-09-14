@@ -14,8 +14,8 @@
 | 2 | 声明 `@colbymchenry/codegraph` 为 dependency；runner 解析链 = 插件内依赖 → `~/.codegraph` 缓存 → PATH | [0002](docs/adr/ADR-0002-codegraph-runtime-provisioning.md) |
 | 3 | B1 = `systemPrompt.section`；B2 = `agent/pre-step` 改写 + 官方 `prompt-hook` 门控 | [0003](docs/adr/ADR-0003-two-layer-prompt-injection.md) |
 | 4 | 工具面 `core` = `explore` + `index`；`full` 追加 8 个 | [0004](docs/adr/ADR-0004-tool-surface-explore-and-index.md) |
-| 5 | 查询前自动 `sync`；`init`/`index` 走 `ask` 审批，`sync` 放行 | [0005](docs/adr/ADR-0005-index-lifecycle.md) |
-| 6 | 零构建单包；手写 client bundle；设置面板承载全部 7 个设置（无状态行） | [0006](docs/adr/ADR-0006-plugin-shape-and-settings-card.md) |
+| 5 | 查询前自动 `sync`；未索引时自动 `init`（受 `autoIndexMaxFiles` 限制）；工具发起的 `init`/`index` 走 `ask` 审批，`sync` 放行 | [0005](docs/adr/ADR-0005-index-lifecycle.md) |
+| 6 | 零构建单包；手写 client bundle；设置面板承载全部 9 个设置（无状态行） | [0006](docs/adr/ADR-0006-plugin-shape-and-settings-card.md) |
 
 ---
 
@@ -80,13 +80,15 @@ export const Config = z.object({
   frontload: z.boolean().default(true),
   surface: z.union([z.const('core'), z.const('full')]).default('core'),
   autoSync: z.boolean().default(true),
+  autoIndex: z.boolean().default(true),
+  autoIndexMaxFiles: z.natural().min(1).default(10000),
   executable: z.string().default('codegraph'),
-  exploreTimeoutMs: z.natural().min(1).default(120000),
-  indexTimeoutMs: z.natural().min(1).default(900000),
+  exploreTimeoutSec: z.natural().min(1).default(120),
+  indexTimeoutSec: z.natural().min(1).default(900),
 })
 ```
 
-前三个是**设置面板行为段里的开关**，因此实际生效值必须走 `ctx.settings` 解析后的结果，不能只用 `apply(ctx, config)` 的入参（那个是组装默认值）。七个字段全部上卡片，组装层只是这批值的默认来源。
+前三个是**设置面板行为段里的开关**，因此实际生效值必须走 `ctx.settings` 解析后的结果，不能只用 `apply(ctx, config)` 的入参（那个是组装默认值）。九个字段全部上卡片，组装层只是这批值的默认来源。
 
 ### 2.2 runner
 
@@ -159,11 +161,16 @@ Limits: the index is refreshed before every query, but a symbol added outside th
 
 去重是必须的：GUI 重发/重试会让同一条 prompt 多次进 `nextTurn`，不去重会重复注入十几 KB。
 
-### 2.5 index 审批
+### 2.5 index 审批与自动 init
 
 `ctx.on('tools/pre-execute')` 里判断 `name === 'codegraph_index'` 且 `arguments.operation` 是 `init` 或 `index` → 返回 `ask` 决策（走 `ctx.approval`）。`sync` 与其余工具放行。缺审批服务时按 fail-closed 处理。
 
 `operation: init` 不接受 `--force`；根目录 / 家目录路径直接拒绝。
+
+插件**自己**发起的 `init`（`codegraph_explore` 发现工作区没有索引时）不走这道门：授权是用户在设置里给的
+（`autoIndex`，默认开），决定"多大算太大"的旋钮是 `autoIndexMaxFiles`（默认 1 万）。计数只遍历目录树、
+跳过点目录与 `node_modules`，超过上限立刻停止遍历。超过上限、`autoIndex` 关掉或 `init` 失败时，改由
+`explore` 返回说明文本，让模型走工具 + 审批那条路。
 
 ### 2.6 client 卡片
 
@@ -184,7 +191,7 @@ window.__ModuleLoader__.load({
 
 - `NS` 必须与 host 侧 `ctx.settings.register(NS, Schema)` 的 namespace **完全一致**——它是唯一的 join key。
 - 实现前先对照任一已装 `dsh-context` 的 profile：`~/.dsh/profiles/<profile>/node_modules/dsh-context/lib/client.js`（其 9761–9790 行是完整可抄的注册骨架）。
-- 面板是设置页其它插件卡片同形的 `<li>`：标题行开合，面板内分段列出全部 7 个字段，底部撤销/放弃/保存；写入是暂存式、带 revision 的一次 mutation。**不放状态行**（理由见 ADR-0006）。
+- 面板是设置页其它插件卡片同形的 `<li>`：标题行开合，面板内列出全部 9 个字段；控件改动即写入（`scope.set` / `scope.unset`），没有保存按钮。**不放状态行**（理由见 ADR-0006）。
 
 ---
 
@@ -196,10 +203,10 @@ window.__ModuleLoader__.load({
 |---|---|---|
 | **P0** 骨架 | `package.json` / `cordis.patch.yml` / 空 `apply` / `README.md`；开发期用 `dsh plugin --profile <name> add <本仓库路径>` 装进任一 profile | `dsh --profile <name> --dump-default-config` 里出现本插件行；启动无报错 |
 | **P1** B1 | `lib/guide.js` 文案定稿 + `section()` + `getSectionOrder` | 新会话里模型能复述"优先用 codegraph_explore 而不是 grep"；`guide: false` 后消失；subagent 也生效 |
-| **P2** runner + 两个工具 | `lib/runner.js`（解析链、Windows 分支、超时、错误归一）；`explore` / `index`；自动 `sync` | Windows 上 `explore` 返回真实源码；未索引时错误文案可读；取消能杀掉进程；`autoSync: false` 后行为退化但可用 |
-| **P3** 审批门禁 | `tools/pre-execute` 的 `ask`；路径白名单 | `init` 弹审批；拒绝后不建索引；`sync` 不弹 |
+| **P2** runner + 两个工具 | `lib/runner.js`（解析链、Windows 分支、超时、错误归一）；`explore` / `index`；自动 `sync`；未索引时自动 `init` | Windows 上 `explore` 返回真实源码；未索引的工作区被自动建索引后返回结果；超上限/关掉开关时给出可读说明；取消能杀掉进程；`autoSync: false` 后行为退化但可用 |
+| **P3** 审批门禁 | `tools/pre-execute` 的 `ask`；路径白名单 | `init` 弹审批；拒绝后不建索引；`sync` 不弹；插件自动发起的 `init` 不走门禁 |
 | **P4** B2 | `agent/pre-step` + `prompt-hook` + 去重 + 熔断 | 结构性 prompt 注入 `<codegraph_context>`；非结构性静默；同文重发不重复；超时 3 s 后放弃不拖 turn |
-| **P5** 设置面板 | `lib/client.js` + `dsh.client` + host 侧 `settings.register` | 设置页出现 CodeGraph 面板，7 个字段可存可放弃可重置；值落 `~/.dsh/settings.yaml` |
+| **P5** 设置面板 | `lib/client.js` + `dsh.client` + host 侧 `settings.register` | 设置页出现 CodeGraph 面板，9 个字段即改即存、可重置；值落 `~/.dsh/settings.yaml` |
 | **P6** full 面 | 其余 8 个工具 | 每个工具一次真实调用 |
 | **P7** 收尾 | 补 README：Model Experience、已知限制、**从 MCP 接入迁移的说明**（装了本插件后可有可无地移除既有 `mcp-codegraph` 行） | README 能让新用户独立完成安装、迁移与排障 |
 
@@ -218,10 +225,11 @@ window.__ModuleLoader__.load({
 
 端到端验收（人工，一次）：
 
-1. **未索引**的中型仓库 → 问结构性问题 → 模型调 `codegraph_explore` → 报未索引 → 征求同意 → `codegraph_index`（弹审批）→ 再 `explore` 回答。
+1. **未索引**的中型仓库 → 问结构性问题 → 模型调 `codegraph_explore` → 插件自动 `init` → 同一次调用里拿到答案。
 2. **已索引**仓库 → 问"X 是怎么实现的" → 一次 `explore` 拿到源码与调用链，不退回 grep/read。
 3. 改一个源文件后立刻问 → 结果反映新代码。
 4. 新增一个符号后立刻问 → 结果**能找到它**（这是 `autoSync` 存在的全部理由）。
+5. 把 `autoIndexMaxFiles` 调到 1 → 未索引的仓库不再自动建索引，返回说明让人或模型去 `codegraph_index`。
 
 ---
 
@@ -241,7 +249,9 @@ window.__ModuleLoader__.load({
 | 10 | 自动 sync 在大仓库可能到秒级 | `autoSync` 开关；实测后决定是否放上卡片 |
 | 11 | 自动 sync 是写操作，只读项目会失败 | sync 失败降级为"继续查询 + 标注索引可能陈旧"，不整体失败 |
 | 12 | shim 的 `stdio: 'inherit'` 实现细节 | 加断言；上游改管道就自己接 |
-| 13 | 自动 sync 与 `init` 口径冲突（官方说别自己建索引） | 审批门禁把决定权交回用户；README 里说明这一有意偏离 |
+| 13 | 自动 sync 与 `init` 口径冲突（官方说别自己建索引） | 用户明确要求自动建：`autoIndex` + `autoIndexMaxFiles` 两道闸；工具发起的 `init` 仍走审批；README 说明这一有意偏离 |
+| 14 | 自动 init 在超大仓库可能跑很久 | `autoIndexMaxFiles`（默认 1 万）在计数超限时立刻放弃，并把决定交回模型/用户 |
+| 15 | 并发 `explore` 同时触发 init | 按 root 记录 in-flight 的构建 promise，同一根目录只跑一次 |
 
 ---
 
