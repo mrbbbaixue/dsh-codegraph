@@ -50,3 +50,23 @@ CLI 路线的实测证据：调用 `codegraph explore` 前后系统内 node 进�
 
 - **保留 MCP，插件只做提示词注入 + index 工具**：白拿 watcher 和常驻进程的性能，但模型会同时看到 `codegraph_explore` 和 `mcp__codegraph__codegraph_explore` 两个近乎同名的工具，B1 文案还得解释用哪个；且把项目绕回"常驻 daemon"形态，与立项诉求冲突。
 - **插件自己起后台 watcher 维持新鲜度**：官方的监听逻辑只能通过 `serve --mcp` 拿到，不开放复用；自己实现要处理文件监听、去抖、崩溃恢复、跨平台策略，性价比极低。
+
+## 修订记录
+
+### 2026-09-16：查询改走常驻 MCP 会话，本文的接入形态被覆盖
+
+**起因**：用户要求把官方那套「常驻 daemon + 文件 watcher」做出来，目标是「不需要每次启动，也不需要每次查询前
+sync」。
+
+**改了什么**：查询改走**插件自己实现的 MCP 客户端**（`lib/session.js`，每项目一条常驻
+`codegraph serve --mcp` 会话），CLI 只保留写索引的动作（`init` / `index`）与 MCP 面无对应物的命令
+（`affected`）。
+
+**为什么当年否决 MCP 的三条理由都不再成立**：`initialize.instructions` 仍然被 dsh 的 MCP 客户端丢弃——但本
+插件既然自己写客户端，就不依赖它，B1 反而能覆盖到 subagent；「只暴露 1 个工具、没有自举」与本插件自己注册
+工具面无关，`codegraph_index` + `autoIndex` 照旧；「`serve --mcp` 会拉常驻进程」**正是这次要的东西**，它替代了
+本文代价里那条「失去 watcher」。
+
+**没变的部分**：不注册 `@deepseek-ai/dsh-mcp-client`；`codegraph` 仍是子进程而非 SDK（同步 sqlite 会卡住 dsh
+的事件循环，见本文「理由」）；自举能力仍由本插件提供。完整决策见
+[ADR-0007](ADR-0007-resident-mcp-session.md)。

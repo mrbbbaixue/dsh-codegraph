@@ -1,7 +1,7 @@
 # @mrbbbaixue/dsh-codegraph
 
-CodeGraph 代码知识图谱能力，以 DeepSeek Harness 插件的形式提供，**替换** dsh 既有的 MCP 接入方式
-（`@deepseek-ai/dsh-mcp-client` + `codegraph serve --mcp`）。
+CodeGraph 代码知识图谱能力，以 DeepSeek Harness 插件的形式提供。它**自己实现** codegraph 的 MCP 客户端，
+不再依赖 `@deepseek-ai/dsh-mcp-client`。
 
 - 决策理由：[`docs/adr/`](docs/adr/README.md)
 - 术语：[`docs/glossary.md`](docs/glossary.md)
@@ -10,21 +10,49 @@ CodeGraph 代码知识图谱能力，以 DeepSeek Harness 插件的形式提供�
 
 ---
 
-## 为什么不是 MCP
+## 架构：常驻会话查询，CLI 只做索引写入
 
-dsh 已经能用 codegraph——通过 MCP。写这个插件不是为了「能用」，而是因为 MCP 这条路径丢掉了两样东西：
+查询走**每个项目一条常驻 MCP 会话**：插件 spawn 一个长期存活的 `codegraph serve --mcp -p <project>`，
+由它背后的 detached daemon 持有**文件 watcher** 和唯一的 SQLite writer。于是：
+
+- 一次查询**不再启进程**（CLI 每次调用要付 300–500 ms 冷启动）；
+- 索引由 watcher 在写入后 1–2 秒自动同步，**不再需要查询前先 `sync`**。
+
+写索引的动作（`init` / `index`）和 MCP 面没有对应物的命令（`affected`）仍走一次性 CLI 子进程——这些命令
+不碰 daemon 的 writer lock，可以并存。
+
+dsh 自带的 MCP 客户端丢掉两样东西，这也是插件必须自己实现客户端的理由：
 
 1. **提示词进不来。** codegraph 在 MCP `initialize` 响应里返回约 4.5 KB 的 `SERVER_INSTRUCTIONS`
    playbook（「reach for codegraph BEFORE grep/read」+ 四条 anti-pattern）。dsh 的 MCP 客户端不读
-   `instructions` 字段，这段文本从来没进过模型上下文。插件把它做成 `systemPrompt.section`，每个请求都在，
-   **subagent 也在**。
+   `instructions` 字段。插件把**这段文本整段**做成 `systemPrompt.section`（`lib/guide.js`），每个请求都在，
+   **subagent 也在**——而官方自己的 MCP `instructions` 到不了 subagent。
 2. **没有自举能力。** MCP 默认只暴露 `codegraph_explore`；未索引时官方口径是「indexing is your decision」，
    不代跑 `init`。插件补上 `codegraph_index`，并且**第一次查询发现没有索引就直接建**（`autoIndex`，文件数
    上限 `autoIndexMaxFiles`，默认 1 万）；模型自己发起的 `init`/`index` 仍然弹审批。
 
-另外：CLI 子进程不拉常驻 daemon，`serve --mcp` 会。
+代价是插件会拉起一个**共享的常驻 daemon**（约 30 MB，与 Claude Code / Cursor 用的是同一个）。它设计上就是
+detached 的：插件退出后由它自己的客户端扫描与 idle 超时回收，通常几分钟内消失。
 
-代价是失去 watcher，由**查询前自动 `sync`** 与**未索引时的自动 `init`** 补偿（见下）。
+### 会话进程的回收
+
+常驻会话是本插件唯一会长期持有的进程，所以它的生命周期有明确的三道闸，任何一道都不依赖「用户会记得清理」：
+
+| 闸 | 触发 | 效果 |
+|---|---|---|
+| 项目空闲回收 | `sessionIdleSec`（默认 900 秒）内没有任何查询 | 停掉该项目的会话进程；下次查询自动重建 |
+| 数量上限 | 同时超过 8 个项目有活跃会话 | 淘汰最久没被用的那个空闲会话，不碰正在跑调用的 |
+| 插件卸载 | dsh 关闭或插件被卸载（`ctx.effect` 的 disposer） | 停掉全部会话进程 |
+
+三个细节值得写清：
+
+- **空闲判定是懒的 + 定时兜底。** 每次调用前先就地清一遍已经空闲的会话（这样「换项目」立刻生效），
+  另有一个 30 秒的定时器（`unref` 过，不会拖住宿主进程）负责「再也不会有下一次调用」的那种。
+- **正在跑调用的会话永远不会被动。** 空闲回收与上限淘汰都跳过 `inFlight > 0` 的会话；上限因此可能被短暂
+  超过，而不是掐断一次活着的调用。
+- **共享 daemon 不由我们杀。** 它可能同时服务用户自己的 Claude Code / Cursor，杀掉会破坏别人的会话；它自己
+  会在最后一个客户端离开后 30 秒扫描 + 300 秒 idle 超时内退出。插件崩溃或被打 SIGKILL 时也一样——proxy
+  子进程有 PPID 看门狗（5 秒轮询）会自己退出，随后 daemon 按同样规则回收。
 
 ---
 
@@ -91,19 +119,20 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
 ## 设置
 
 **设置 ▸ 插件 ▸ 插件配置 ▸ CodeGraph** 是一张和设置页其它插件卡片同形的面板：默认收缩，标题行（名称 +
-一句话说明 + chevron）展开后是全部九个设置。**没有保存按钮**：控件一改就写。
+一句话说明 + chevron）展开后是全部十个设置。**没有保存按钮**：控件一改就写。
 
 | 字段 | 控件 | 默认 | 作用 |
 |---|---|---|---|
-| `guide` | 开关 | 开 | B1：把 CodeGraph 指引注入系统提示词（每请求约 1.5 KB） |
+| `guide` | 开关 | 开 | B1：把 CodeGraph 指引注入系统提示词（每请求约 4.5 KB） |
 | `frontload` | 开关 | 开 | B2：结构性提问时在进入本轮前预取代码上下文 |
 | `surface` | 下拉 | `core` | 工具面：`core`（2 个）或 `full`（10 个） |
-| `autoSync` | 开关 | 开 | `explore` 之前跑一次增量 `sync` |
+| `autoSync` | 开关 | 开 | CLI 回退路径上，查询之前跑一次增量 `sync`（走常驻会话的查询不需要它） |
 | `autoIndex` | 开关 | 开 | 第一次查询发现工作区没有 `.codegraph/`，直接跑 `init` |
 | `autoIndexMaxFiles` | 数字框 | 10000 | 项目文件数超过它就**不再**自动建索引，改由模型/用户决定 |
 | `executable` | 文本框 | `codegraph` | 显式指定运行时；留空即自动搜索 |
 | `exploreTimeoutSec` | 数字框 | 120 | 单次 `explore` 的上限（秒） |
 | `indexTimeoutSec` | 数字框 | 900 | `init` / `index` / 自动建索引的上限（秒） |
+| `sessionIdleSec` | 数字框 | 900 | 项目会话这么久没被查询就停掉、释放进程；下次查询自动重建（秒） |
 
 开关与下拉是设置的官方原语（`@deepseek-ai/dsh-client-ui-primitives` 的 `Switch`、与设置页同一套度量），
 不是自绘的勾选框。
@@ -138,29 +167,23 @@ ones」，其余工具返回的东西 `explore` 已经内联带着。详见
         indexTimeoutSec: 900       # init / index / 自动索引上限（秒）
 ```
 
-`autoSync` 是「自动 sync 在大仓库可能到秒级」这个风险的逃生阀；`autoIndexMaxFiles` 是「自动全量索引在超大
-仓库可能跑很久」这个风险的逃生阀；`executable` 一旦配置就**优先于**自动搜索。两条路等价，选哪条看值该属于谁：
-该 profile 的所有会话共用就写 YAML，只属于你就写面板。
+`autoSync` 是「CLI 回退路径的自动 sync 在大仓库可能到秒级」这个风险的逃生阀；`autoIndexMaxFiles` 是「自动
+全量索引在超大仓库可能跑很久」这个风险的逃生阀；`executable` 一旦配置就**优先于**自动搜索。两条路等价，
+选哪条看值该属于谁：该 profile 的所有会话共用就写 YAML，只属于你就写面板。
 
 ---
 
-## 索引生命周期：自动 sync 与自动 init
+## 索引生命周期：watcher 自动同步 + 自动 init
 
-CLI 路径没有 watcher。实测后果不是「结果旧一点」，而是：
+查询走常驻会话时，索引由**后台 daemon 的文件 watcher** 维护：源码写入后经约 2 秒的 debounce（待同步文件
+≤2 个时 300 ms）自动增量同步。这就是「不需要查询前先 `sync`」的来源。
 
-| 改了什么 | 未 sync 时 `explore` 的表现 |
-|---|---|
-| 改函数体 | 返回**新源码**（源码段从磁盘重读），带 staleness banner |
-| **新增符号** | 返回 `No relevant code found`——**没有 banner、没有报错**，就像这个符号不存在 |
+watcher 覆盖不到的那一小段窗口由 codegraph 自己的 banner 兜底：内容漂移的文件会被标为 changed on disk，
+整个监听停摆时会给出 auto-sync DISABLED 的提示。监听一旦 degrade（WSL2 的 `/mnt`、inotify 配额耗尽、
+`CODEGRAPH_NO_WATCH`），索引就静默不再更新——banner 是模型唯一的信号。
 
-新增符号恰好是模型改代码时最高频的动作。留着这个盲区，B1 里「不要用 grep 复核 codegraph 结果」就成了陷阱。
-所以 `codegraph_explore` 执行前会跑一次 `sync`（增量，实测 400–500 ms）。
-
-`sync` 失败**不会**让查询失败：降级为「继续查询 + 标注索引可能陈旧」，这样只读项目仍可用。
-
-**工作区没有索引时，`explore` 先跑 `init`。** 这是自动的，模型不必记得调工具，也不必先问一句：B1 要求
-「调研代码先 explore」，而未索引时那句「CodeGraph isn't available here」会让这条指令直接落空。自动索引有
-两道闸：
+**未索引时 `explore` 先跑 `init`。** 这是自动的，模型不必记得调工具，也不必先问一句：B1 要求「调研代码先
+explore」，而未索引时那句「CodeGraph isn't available here」会让这条指令直接落空。自动索引有两道闸：
 
 1. `autoIndex`（默认开）——关掉就回到「模型告知用户、由审批门禁决定」的老路径。
 2. `autoIndexMaxFiles`（默认 10000）——文件数超过上限就不建，返回一条说明让模型去调 `codegraph_index`。
@@ -173,6 +196,20 @@ CLI 路径没有 watcher。实测后果不是「结果旧一点」，而是：
 预算上，自动 `init` 走 `indexTimeoutSec` 这一档（与 `codegraph_index` 的 `init` / `index` 相同），而这一次
 `explore` 调用的整体上限是 `exploreTimeoutSec + indexTimeoutSec`——否则默认两分钟的查询预算会把一次合法的
 全量索引掐死。`autoIndex` 关掉时，`explore` 的上限回到 `exploreTimeoutSec`。
+
+### CLI 回退路径仍然先 `sync`
+
+MCP 面没有对应物的命令（`affected`）、以及未索引项目上的查询，走一次性 CLI 子进程。这条路径没有 watcher，
+`autoSync`（默认开）就是它的新鲜度补偿：执行前跑一次增量 `sync`（实测 400–500 ms）。
+
+留着它不是冗余，因为 CLI 路径的盲区同样致命：
+
+| 改了什么 | 未 sync 时 CLI 查询的表现 |
+|---|---|
+| 改函数体 | 返回**新源码**（源码段从磁盘重读），带 staleness banner |
+| **新增符号** | 返回 `No relevant code found`——**没有 banner、没有报错**，就像这个符号不存在 |
+
+`sync` 失败**不会**让查询失败：降级为「继续查询 + 标注索引可能陈旧」，这样只读项目仍可用。
 
 ---
 
@@ -201,32 +238,24 @@ CLI 路径没有 watcher。实测后果不是「结果旧一点」，而是：
 
 #### What the model sees
 
-`guide` 为真时，每个请求的系统提示词里多出下面这一段（约 1.5 KB，约 400 tokens），位置在
-`TOOL_BASH`(1000) 之前、`TOOL_READ`(1100) 之前：
+`guide` 为真时，每个请求的系统提示词里多出 codegraph 官方 `initialize.instructions` 的**全文**，位置在
+`TOOL_BASH`(1000) 之前、`TOOL_READ`(1100) 之前。文本在 [`lib/guide.js`](lib/guide.js)（约 4.5 KB，
+约 1600 tokens），不在本文件重复。
 
-##### Verbatim text for this field
+相对上游原文只有五处改动，每一处都是**在 dsh 里会变成假话**的句子：
 
-```markdown
-# CodeGraph — pre-indexed code knowledge graph
-
-CodeGraph is a pre-computed graph of every symbol and call edge in a project, built by the `codegraph` CLI. When the current workspace is indexed (a `.codegraph/` directory at its root), reach for these tools BEFORE grep/glob/read to locate or understand code:
-
-- `codegraph_explore` — PRIMARY, and Read-equivalent. Give it a natural-language question or a bag of symbol/file names. One capped call returns the verbatim, line-numbered source of the relevant symbols grouped by file — treat that source as already read — plus the call paths among them (including dynamic-dispatch hops grep cannot follow) and a blast-radius summary.
-- `codegraph_index` — build or refresh the index (`operation: init | sync | index`). `init` and `index` ask the user first; `sync` is cheap and incremental.
-
-Anti-patterns — do NOT:
-- grep/glob first "to find the files": one `codegraph_explore` call replaces dozens of round-trips.
-- re-verify codegraph results with grep: they come from a full AST parse.
-- reconstruct a flow by hand: name the endpoints in one `codegraph_explore` and it surfaces the path between them.
-- keep calling codegraph after it reports the workspace is not indexed and the user declined to index it: use the built-in tools there instead.
-
-Limits: the index is refreshed before every query, but a symbol added outside this session may still be missing until then. Cross-file resolution is best-effort name matching. CodeGraph is not a correctness check — that is still the compiler, tests, and linter.
-```
+| 改动 | 为什么 |
+|---|---|
+| 补上 `codegraph_index` | 原文说「There is a single tool」；本插件 `core` 面有两个，且 index 是插件自造的 |
+| 删掉 deferred tool 那句 | dsh 没有「列出但延迟加载」的中间态（ADR-0004），不注册就是不存在 |
+| `projectPath` → `path` | 本插件的参数名；同时删掉「no live watcher」那个括号——每条常驻会话都有 watcher |
+| 重写未索引那条限制 | 原文让模型「别自己跑 init」；本插件第一次查询就会建索引 |
+| 删掉 `CODEGRAPH_EXPLORE_DEDUP` 一段 | 那个去重只在「一连接一上下文」时安全；本插件把整个 dsh 进程的多会话复用在一条连接上，去重会吞掉别的会话没见过的源码 |
 
 #### Token effect
 
-固定：约 1.5 KB/请求（约 400 tokens）。`guide: false` 时为零。`surface: 'full'` 额外增加 8 个工具
-schema，也是每请求固定成本。
+固定：约 4.5 KB/请求（约 1600 tokens），每个请求、**包括 subagent 的请求**。`guide: false` 时为零。
+`surface: 'full'` 额外增加 8 个工具 schema，也是每请求固定成本。
 
 #### KV Cache effect
 
@@ -256,7 +285,9 @@ GUI 重发不会重复注入。
 #### What the model sees
 
 `explore` 的 markdown：`**Exploration: <query>**` → `Found N symbols across M files` → 波及面 → 逐字源码
-（按文件分组、带行号）→ 调用路径。`codegraph_index` 与 `full` 面的多数工具返回 CLI 的 JSON 或简短文本。
+（按文件分组、带行号）→ 调用路径。这是 codegraph 服务端的同一个字符串——常驻会话走 `tools/call` 拿到的
+`content[0].text`，与 `codegraph explore` 的 stdout 逐字相同。`full` 面的多数工具同理；
+`codegraph_index` 与 `affected` 返回 CLI 的 JSON 或简短文本。
 
 #### Token effect
 
@@ -271,8 +302,17 @@ GUI 重发不会重复注入。
 
 ## 已知限制与未完成的工作
 
-- **自动 sync 在大仓库未测到秒级。** 实测数字来自 2 文件项目（400–535 ms）；大仓库可能显著更高。逃生阀是
-  `autoSync` 开关。
+- **常驻 daemon 是共享的、detached 的。** 插件退出后它不会立刻死，而是等自己的客户端扫描（30 s）与 idle
+  超时（300 s）回收，通常几分钟内消失。Windows 上它持有项目目录里的索引文件，所以**只要 daemon 还活着，
+  那个项目目录就删不掉**。用 `codegraph daemon` 可以手动停它。
+- **daemon 与 proxy 的版本必须完全相等。** codegraph 升级后，旧 daemon 会让新会话一律降级到进程内只读模式
+  ——查询仍可用，但自动同步失效。升级后要手动停掉旧 daemon。
+- **CLI 的 `sync` 在 daemon 正在同步时可能静默返回空结果**（拿不到 `codegraph.lock`）。所以 `autoSync` 只是
+  CLI 回退路径的尽力而为，不是可靠的新鲜度保证；可靠的那条是 watcher。
+- **watcher 会永久 degrade。** WSL2 的 `/mnt`、`CODEGRAPH_NO_WATCH`、inotify 配额耗尽都会让它静默停摆，
+  此时模型只能靠响应里的 staleness banner 察觉。
+- **CLI 回退路径的自动 sync 在大仓库未测到秒级。** 实测数字来自 2 文件项目（400–535 ms）；大仓库可能显著
+  更高。逃生阀是 `autoSync` 开关。
 - **B2 依赖 `codegraph prompt-hook` 这个 hidden 命令**（官方定位 Claude Code 专有）。官方契约是「任何失败
   都 exit 0 且无输出」，插件侧再加熔断（连续失败 2 次后本进程内不再尝试）。上游一旦改名或删除，B2 静默
   退化为无操作，不影响 B1 与工具面。

@@ -153,6 +153,120 @@ function createScriptedSubprocess(plan) {
 }
 
 /**
+ * A subprocess service that speaks the MCP wire protocol over its pipes.
+ *
+ * The resident session's contract is "one child, many correlated JSON-RPC
+ * calls", which a one-shot stdout dump cannot express: this double parses each
+ * request line, answers `initialize`, and records every `tools/call` before
+ * answering it.
+ *
+ * @param replyFor - maps a tool name to the text it returns.
+ * @returns the service plus its spawn count and call log.
+ */
+function createScriptedMcpSubprocess(replyFor) {
+  const calls = []
+  const children = []
+  return {
+    calls,
+    /** One entry per spawned child, so a test can prove it was terminated. */
+    children,
+    /** @returns how many children were started — the number the session must keep at one. */
+    get spawns() {
+      return children.length
+    },
+    async resolveExecutable() {
+      return process.execPath
+    },
+    /** @param spec - the spawn request. @returns a handle shaped like the seam's. */
+    spawn(spec) {
+      const child = { argv: spec.argv, terminated: false }
+      children.push(child)
+      const stdin = new PassThrough()
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      stderr.resume()
+      let buffer = ''
+      stdin.setEncoding('utf8')
+      stdin.on('data', (chunk) => {
+        buffer += chunk
+        let cut = buffer.indexOf('\n')
+        while (cut !== -1) {
+          const line = buffer.slice(0, cut).trim()
+          buffer = buffer.slice(cut + 1)
+          cut = buffer.indexOf('\n')
+          if (line === '') continue
+          const message = JSON.parse(line)
+          if (message.id === undefined) continue
+          if (message.method === 'initialize') {
+            stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05' } })}\n`)
+            continue
+          }
+          calls.push({ argv: spec.argv, name: message.params.name, args: message.params.arguments })
+          const result = { content: [{ type: 'text', text: replyFor(message.params.name) }] }
+          stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result })}\n`)
+        }
+      })
+      return {
+        stdin,
+        stdout,
+        stderr,
+        collected: { stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } },
+        done: new Promise(() => {}),
+        terminate: () => {
+          child.terminated = true
+          stdin.end()
+          stdout.end()
+        },
+        waitForExit: async () => true,
+      }
+    },
+  }
+}
+
+/**
+ * Terminate every resident session the plugin started.
+ *
+ * A live session's child is spawned **with the project as its cwd**, and Windows
+ * keeps a handle on a directory for as long as any process is sitting in it — so
+ * the fixture cannot be deleted until these children are gone.
+ *
+ * @param record - the stub context's recorded state.
+ */
+function disposeSessions(record) {
+  for (const disposer of record.disposers) disposer()
+}
+
+/**
+ * Stop the daemon a real query left behind, then delete the directory it holds
+ * open.
+ *
+ * `serve --mcp` spawns a **detached** daemon on purpose: it is shared with every
+ * other client of that project, and it outlives the client that started it until
+ * its own idle timeout. On Windows that daemon keeps the index files open, so a
+ * plain `rmSync` fails with EBUSY. Stopping it the way `codegraph daemon` does —
+ * read the lockfile, signal the pid — is what makes the fixture removable.
+ *
+ * @param dir - the fixture directory to stop the daemon for and delete.
+ */
+async function removeFixture(dir) {
+  try {
+    const { pid } = JSON.parse(readFileSync(join(dir, '.codegraph', 'daemon.pid'), 'utf8'))
+    if (Number.isInteger(pid)) process.kill(pid)
+  } catch {
+    // No daemon was started for this fixture, or it is already gone.
+  }
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return
+    } catch {
+      await new Promise((settle) => setTimeout(settle, 100))
+    }
+  }
+  rmSync(dir, { recursive: true, force: true })
+}
+
+/**
  * Resolve an executable name against `PATH`, honouring `PATHEXT` on Windows.
  * @param command - bare name or absolute path.
  * @returns the resolved path.
@@ -183,6 +297,7 @@ function createStubContext(options = {}) {
     tools: new Map(),
     sections: [],
     listeners: new Map(),
+    disposers: [],
     registeredSettings: undefined,
     settingsSource: undefined,
     settingsHooks: undefined,
@@ -228,6 +343,12 @@ function createStubContext(options = {}) {
     on(event, listener) {
       record.listeners.set(event, listener)
       return () => record.listeners.delete(event)
+    },
+    /** @param execute - the effect body, which returns the disposer it registered. */
+    effect(execute) {
+      const disposer = execute()
+      if (typeof disposer === 'function') record.disposers.push(disposer)
+      return () => {}
     },
     /** @param deps - requested services. @param callback - the consumer. */
     inject(deps, callback) {
@@ -422,12 +543,20 @@ await test('a settings change re-derives the whole surface without duplicate err
 await test('an unusable timeout is refused at the write, not at registration', async () => {
   const { ctx, record } = createStubContext({ settings: plugin.Config({}) })
   plugin.apply(ctx, plugin.Config({}))
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 0, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }), /positive/)
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: -5, autoIndexMaxFiles: 10_000 }), /positive/)
-  assert.doesNotThrow(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }))
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 0 }), /positive whole number of files/)
-  assert.throws(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 1.5 }), /positive whole number of files/)
-  assert.doesNotThrow(() => record.settingsHooks.validate({ exploreTimeoutSec: 1, indexTimeoutSec: 1, autoIndexMaxFiles: 10_000 }))
+  // The validator sees the fully resolved section, so every case starts from one.
+  const resolved = {
+    exploreTimeoutSec: 1,
+    indexTimeoutSec: 1,
+    sessionIdleSec: 1,
+    autoIndexMaxFiles: 10_000,
+  }
+  assert.throws(() => record.settingsHooks.validate({ ...resolved, exploreTimeoutSec: 0 }), /positive/)
+  assert.throws(() => record.settingsHooks.validate({ ...resolved, indexTimeoutSec: -5 }), /positive/)
+  assert.throws(() => record.settingsHooks.validate({ ...resolved, sessionIdleSec: 0 }), /positive/)
+  assert.doesNotThrow(() => record.settingsHooks.validate(resolved))
+  assert.throws(() => record.settingsHooks.validate({ ...resolved, autoIndexMaxFiles: 0 }), /positive whole number of files/)
+  assert.throws(() => record.settingsHooks.validate({ ...resolved, autoIndexMaxFiles: 1.5 }), /positive whole number of files/)
+  assert.doesNotThrow(() => record.settingsHooks.validate(resolved))
 })
 
 await test('an unindexed workspace is indexed before the first query runs', async () => {
@@ -801,6 +930,183 @@ await test('frontload:false never runs the hook', async () => {
 })
 
 // ---------------------------------------------------------------------------
+// Resident MCP session
+// ---------------------------------------------------------------------------
+
+section('Resident MCP session')
+
+/**
+ * A directory that looks indexed to `findIndexRoot`, which only tests for the
+ * marker database's presence.
+ * @returns the fixture directory.
+ */
+function indexedFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'cg-session-'))
+  mkdirSync(join(dir, '.codegraph'), { recursive: true })
+  writeFileSync(join(dir, '.codegraph', 'codegraph.db'), '')
+  return dir
+}
+
+await test('an indexed project answers explore over a resident session', async () => {
+  const dir = indexedFixture()
+  const mcp = createScriptedMcpSubprocess(() => 'session answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    const output = await record.tools.get('codegraph_explore').execute({ query: 'alphaCompute' }, executionFor(dir))
+    assert.equal(output, 'session answer')
+    assert.equal(mcp.spawns, 1)
+    assert.deepEqual(mcp.calls.map((call) => call.name), ['codegraph_explore'])
+    assert.deepEqual(mcp.calls[0].args, { query: 'alphaCompute' })
+    assert.deepEqual(
+      mcp.calls[0].argv.slice(-4),
+      ['serve', '--mcp', '-p', dir],
+      `the session must be launched as an MCP server for the project: ${mcp.calls[0].argv.join(' ')}`,
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('a second query reuses the session instead of starting another child', async () => {
+  const dir = indexedFixture()
+  const mcp = createScriptedMcpSubprocess(() => 'answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    const explore = record.tools.get('codegraph_explore')
+    await explore.execute({ query: 'one' }, executionFor(dir))
+    await explore.execute({ query: 'two' }, executionFor(dir))
+    assert.equal(mcp.spawns, 1, 'the second query must not spawn a second child')
+    assert.deepEqual(mcp.calls.map((call) => call.args.query), ['one', 'two'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('a subdirectory shares the session of the project that governs it', async () => {
+  const dir = indexedFixture()
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  const mcp = createScriptedMcpSubprocess(() => 'answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    const explore = record.tools.get('codegraph_explore')
+    await explore.execute({ query: 'one' }, executionFor(join(dir, 'src')))
+    await explore.execute({ query: 'two' }, executionFor(dir))
+    assert.equal(mcp.spawns, 1, 'one project must not get a session per directory')
+    assert.equal(mcp.calls[0].argv.at(-1), dir, 'the session must be keyed on the project root')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('an idle session is terminated rather than living until shutdown', async () => {
+  const dir = indexedFixture()
+  const mcp = createScriptedMcpSubprocess(() => 'answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({ sessionIdleSec: 1 }))
+  try {
+    const explore = record.tools.get('codegraph_explore')
+    await explore.execute({ query: 'one' }, executionFor(dir))
+    assert.equal(mcp.children[0].terminated, false, 'a session serving a call must stay up')
+    await new Promise((settle) => setTimeout(settle, 1_200))
+    await explore.execute({ query: 'two' }, executionFor(dir))
+    assert.equal(mcp.children[0].terminated, true, 'the idle session should have been terminated')
+    assert.equal(mcp.spawns, 2, 'the next call should have rebuilt it')
+  } finally {
+    disposeSessions(record)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('a sweep across more projects than the cap allows does not accumulate children', async () => {
+  const dirs = Array.from({ length: 9 }, () => indexedFixture())
+  const mcp = createScriptedMcpSubprocess(() => 'answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    const explore = record.tools.get('codegraph_explore')
+    for (const dir of dirs) await explore.execute({ query: 'one' }, executionFor(dir))
+    assert.equal(mcp.spawns, 9)
+    assert.equal(
+      mcp.children.filter((child) => child.terminated === false).length,
+      8,
+      'the least recently used session should have been evicted at the cap',
+    )
+  } finally {
+    disposeSessions(record)
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('disposing the plugin terminates every session it started', async () => {
+  const dirs = [indexedFixture(), indexedFixture()]
+  const mcp = createScriptedMcpSubprocess(() => 'answer')
+  const { ctx, record } = createStubContext({ subprocess: mcp })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    for (const dir of dirs) await record.tools.get('codegraph_explore').execute({ query: 'one' }, executionFor(dir))
+    assert.equal(mcp.children.filter((child) => child.terminated === false).length, 2)
+    disposeSessions(record)
+    assert.equal(
+      mcp.children.filter((child) => child.terminated === false).length,
+      0,
+      'every child must be terminated on dispose',
+    )
+  } finally {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('index and affected stay on the CLI', async () => {
+  const dir = indexedFixture()
+  const scripted = createScriptedSubprocess(() => ({ stdout: 'ok' }))
+  const { ctx, record } = createStubContext({ subprocess: scripted })
+  plugin.apply(ctx, plugin.Config({ surface: 'full' }))
+  try {
+    await record.tools.get('codegraph_index').execute({ operation: 'sync' }, executionFor(dir))
+    await record.tools.get('codegraph_affected').execute({ files: ['src/alpha.ts'] }, executionFor(dir))
+    const commands = scripted.calls.map((spec) => spec.argv.join(' '))
+    assert.equal(commands.length, 2)
+    for (const command of commands) {
+      assert.ok(!command.includes('serve --mcp'), `must not route through the resident session: ${command}`)
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('an unindexed project is still indexed before the session is used', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cg-bootstrap-'))
+  const scripted = createScriptedSubprocess((spec) =>
+    spec.argv.includes('init') ? { stdout: 'ignore me' } : { stdout: 'query answer' },
+  )
+  const { ctx, record } = createStubContext({ subprocess: scripted })
+  plugin.apply(ctx, plugin.Config({}))
+  try {
+    const output = await record.tools.get('codegraph_explore').execute({ query: 'anything' }, executionFor(dir))
+    assert.match(output, /built one automatically/u, `the bootstrap note is missing: ${output.slice(0, 200)}`)
+    assert.match(output, /query answer/u, 'the query itself must still run')
+    assert.equal(scripted.calls.length, 2, 'the CLI must run init and then the query')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('the guide carries codegraph own playbook, index tool included', async () => {
+  const { ctx, record } = createStubContext({})
+  plugin.apply(ctx, plugin.Config({}))
+  const [guide] = record.sections
+  assert.ok(guide !== undefined, 'no guide section was registered')
+  assert.match(guide.text, /Codegraph IS the pre-built search index/u)
+  assert.match(guide.text, /## Anti-patterns/u)
+  assert.match(guide.text, /## Limitations/u)
+  assert.match(guide.text, /Rust, Java, C#, C\/C\+\+/u, 'the upstream language list should survive')
+  assert.match(guide.text, /`codegraph_index`/u, 'the plugin own tool must be named')
+})
+
+// ---------------------------------------------------------------------------
 // Integration: the real CLI against a fixture this file owns
 // ---------------------------------------------------------------------------
 
@@ -861,7 +1167,8 @@ if (cliAvailable) {
       assert.ok(existsSync(join(bare, '.codegraph', 'codegraph.db')), `no index was written: ${output.slice(0, 400)}`)
       assert.match(output, /bareSymbol/u, `the automatic index did not surface the symbol: ${output.slice(0, 400)}`)
     } finally {
-      rmSync(bare, { recursive: true, force: true })
+      disposeSessions(record)
+      await removeFixture(bare)
     }
   })
 
@@ -871,13 +1178,13 @@ if (cliAvailable) {
     await assert.rejects(indexTool.execute({ operation: 'init' }, rootExec), /refusing to index/u)
   })
 
-  rmSync(fixture, { recursive: true, force: true })
+  disposeSessions(record)
+  await removeFixture(fixture)
 }
 
 // ---------------------------------------------------------------------------
 // Browser half: the hand-written client bundle
 // ---------------------------------------------------------------------------
-
 section('Client bundle')
 
 /**
@@ -1163,7 +1470,7 @@ await test('the panel renders every setting the plugin exposes', () => {
   // Every field the Host's schema declares, and no field it does not.
   assert.deepEqual(
     Object.keys(fullConfig).sort(),
-    ['autoIndex', 'autoIndexMaxFiles', 'autoSync', 'executable', 'exploreTimeoutSec', 'frontload', 'guide', 'indexTimeoutSec', 'surface'].sort(),
+    ['autoIndex', 'autoIndexMaxFiles', 'autoSync', 'executable', 'exploreTimeoutSec', 'frontload', 'guide', 'indexTimeoutSec', 'sessionIdleSec', 'surface'].sort(),
   )
 })
 
@@ -1178,7 +1485,7 @@ await test('the open panel renders one official control per field', () => {
   const rows = elementsWith(panel({ defaultOpen: true }), 'data-field').map(fieldControl)
   assert.deepEqual(
     rows.map((row) => row.field),
-    ['guide', 'frontload', 'surface', 'autoSync', 'autoIndex', 'autoIndexMaxFiles', 'executable', 'exploreTimeoutSec', 'indexTimeoutSec'],
+    ['guide', 'frontload', 'surface', 'autoSync', 'autoIndex', 'autoIndexMaxFiles', 'executable', 'exploreTimeoutSec', 'indexTimeoutSec', 'sessionIdleSec'],
   )
   for (const row of rows) {
     const isToggle = row.field === 'guide' || row.field === 'frontload' || row.field === 'autoSync' || row.field === 'autoIndex'
